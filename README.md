@@ -27,7 +27,9 @@ against assets you own or are explicitly authorized to test.**
 | 4 | **Screenshots** | `screenshots/` + a browsable `gallery.html` |
 | all | 1 → 2 → 3 | everything, in ~15 min |
 
-Each target gets its own `~/recon/results/<target>_<timestamp>/` folder.
+Each target gets its own `./output/<target>_<timestamp>/` folder in the current
+directory (override the base with `JACKAL_HOME`). `working_domains.txt` always
+holds full `http(s)://` URLs, so screenshots and dir-brute never miss them.
 
 ## Subdomain enumeration — no stone unturned
 

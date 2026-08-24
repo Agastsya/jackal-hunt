@@ -18,8 +18,9 @@
 set -uo pipefail
 
 # ----------------------------------------------------------------------------- config
-BASE_DIR="${JACKAL_HOME:-$HOME/recon}"
-RESULTS_DIR="$BASE_DIR/results"
+# output goes to ./output in the current folder by default (override with JACKAL_HOME)
+BASE_DIR="${JACKAL_HOME:-$PWD}"
+RESULTS_DIR="$BASE_DIR/output"
 PATH="$HOME/go/bin:$PATH"     # PREPEND go tools so PD httpx beats /bin/httpx (python)
 # macOS ships without GNU timeout/stdbuf/nproc; `brew install coreutils` provides
 # them under a gnubin dir by their normal names. Prepend it so they resolve
@@ -359,17 +360,23 @@ mode_domains(){
 
   info "probing for live hosts (budget ${DOMAIN_PROBE_BUDGET}s)"
   if [ -n "$HTTPX" ]; then
+    # probe BOTH schemes so http-only hosts aren't missed; keep full scheme URLs
     local pt=$(( THREADS > 150 ? 150 : THREADS ))
     run_timed "probing live hosts" "$DOMAIN_PROBE_BUDGET" "$OUT/live_verbose.txt" \
-      sh -c "cat '$resolved' | '$HTTPX' -silent -threads $pt -timeout 5 -retries 0 -status-code -title -rl 300 -no-color"
+      sh -c "cat '$resolved' | '$HTTPX' -silent -threads $pt -timeout 6 -retries 1 -status-code -title -rl 300 -no-color"
     grep -oE 'https?://[^ ]+' "$OUT/live_verbose.txt" 2>/dev/null | sort -u > "$live"
   else
-    warn "ProjectDiscovery httpx not found; treating resolvable hosts as live"
-    warn "install it: go install github.com/projectdiscovery/httpx/cmd/httpx@latest"
-    cp "$resolved" "$live"
+    warn "ProjectDiscovery httpx not found (install: go install github.com/projectdiscovery/httpx/cmd/httpx@latest)"
+  fi
+  # Guarantee working_domains.txt holds real URLs (with scheme). If the probe
+  # found nothing (or httpx is missing), fall back to https:// on every resolving
+  # host so screenshots/dir-brute still have valid targets — never bare hostnames.
+  if [ ! -s "$live" ]; then
+    warn "probe returned no live URLs — using resolving hosts as https:// candidates"
+    sed 's#^#https://#' "$resolved" | sort -u > "$live"
   fi
   rm -f "$resolved"
-  ok "${W}$(wc -l < "$live" 2>/dev/null | tr -d ' ')${N} working domains -> $live"
+  ok "${W}$(wc -l < "$live" 2>/dev/null | tr -d ' ')${N} working domains (URLs) -> $live"
 
   # ---- screenshot every working domain (auto unless disabled) ----
   if [ "$AUTO_SHOTS_MODE1" = "1" ] && [ -s "$live" ]; then
@@ -624,9 +631,12 @@ mode_screenshot(){
 
   mkdir -p "$ss"
   local list="$OUT/.shotlist"
-  grep -E '^https?://' "$src" 2>/dev/null | sort -u > "$list"
+  # normalise: keep scheme'd URLs as-is; prefix https:// onto bare hostnames so a
+  # working_domains.txt of plain hosts still gets screenshotted (no more skips)
+  awk 'NF && $0 !~ /^[[:space:]]*#/ { if ($0 ~ /^https?:\/\//) print; else print "https://" $0 }' \
+    "$src" 2>/dev/null | sort -u > "$list"
   local total; total=$(wc -l < "$list")
-  [ "$total" -eq 0 ] && { warn "no http(s) URLs in $(basename "$src")"; rm -f "$list"; return 0; }
+  [ "$total" -eq 0 ] && { warn "no hosts/URLs in $(basename "$src")"; rm -f "$list"; return 0; }
   if [ "$total" -gt "$SHOT_CAP" ]; then
     warn "capping at $SHOT_CAP of $total URLs (raise SHOT_CAP to change)"
     head -n "$SHOT_CAP" "$list" > "$list.t" && mv "$list.t" "$list"; total=$SHOT_CAP
