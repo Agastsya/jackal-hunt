@@ -30,13 +30,14 @@ for _gnubin in /opt/homebrew/opt/coreutils/libexec/gnubin /usr/local/opt/coreuti
 done
 export PATH
 
-# time budgets (seconds)
-DOMAIN_ENUM_BUDGET=240        # mode 1: enumeration
-DOMAIN_PROBE_BUDGET=90        # mode 1: live probing
-DIR_BUDGET=600                # mode 2: directory brute total (10 min)
-CRAWL_BUDGET=200              # mode 3: TOTAL budget (katana + gau share this, seconds)
-SHOT_BUDGET=600               # mode 4: screenshotting crawled URLs (10 min)
-SHOT_CAP=150                  # max URLs to screenshot in one run
+# time budgets (seconds) — tuned so a full `run_all` stays within ~15 minutes
+DOMAIN_ENUM_BUDGET=120        # mode 1: passive+dork enumeration (all sources parallel)
+SUB_BRUTE_BUDGET=75           # mode 1: DNS brute + permutation resolve
+DOMAIN_PROBE_BUDGET=75        # mode 1: live HTTP probing
+DIR_BUDGET=300                # mode 2: directory brute total (hosts run in parallel)
+CRAWL_BUDGET=120              # mode 3: TOTAL budget (katana + gau share this)
+SHOT_BUDGET=150               # mode 4: screenshotting (per invocation)
+SHOT_CAP=80                   # max URLs to screenshot in one run
 
 # behaviour toggles (env-overridable)
 SUB_BRUTE="${JACKAL_SUB_BRUTE:-1}"    # DNS-bruteforce subdomains with a wordlist
@@ -142,109 +143,217 @@ authz_gate(){
   case "$a" in y|Y|yes) return 0;; *) err "aborted"; return 1;; esac
 }
 
-# =============================================================================
-# MODE 1 — DOMAIN SEARCH  (<= ~5 min)
-# =============================================================================
-mode_domains(){
-  local all="$OUT/all_domains.txt" live="$OUT/working_domains.txt"
-  : > "$OUT/.raw"
-  info "enumerating subdomains for $TARGET (budget ${DOMAIN_ENUM_BUDGET}s)"
+# --- helpers for mode 1 -------------------------------------------------------
+_gen_resolvers(){
+  cat > "$OUT/.resolvers" <<'EOF'
+1.1.1.1
+1.0.0.1
+8.8.8.8
+8.8.4.4
+9.9.9.9
+149.112.112.112
+208.67.222.222
+208.67.220.220
+64.6.64.6
+77.88.8.8
+EOF
+}
 
-  ( have subfinder && timeout "$DOMAIN_ENUM_BUDGET" subfinder -silent -all -d "$TARGET" 2>/dev/null ) >> "$OUT/.raw" &
-  local p1=$!
-  (
-    timeout 60 curl -s "https://crt.sh/?q=%25.$TARGET&output=json" 2>/dev/null \
-      | grep -oE '"common_name":"[^"]+"|"name_value":"[^"]+"' \
-      | sed -E 's/.*":"//; s/"$//; s/\\n/\n/g' | sed 's/^\*\.//'
-  ) >> "$OUT/.raw" &
-  local p2=$!
-  ( have assetfinder && timeout "$DOMAIN_ENUM_BUDGET" assetfinder --subs-only "$TARGET" 2>/dev/null ) >> "$OUT/.raw" &
-  local p3=$!
+# ready-to-run search dorks for manual deep digging (Google blocks automation,
+# so these are for you to paste; Bing is auto-harvested by _bing_dork below)
+_gen_dorks(){
+  local t="$TARGET"
+  cat > "$OUT/search_dorks.txt" <<EOF
+# Manual dorks for $t — paste into Google/DuckDuckGo. Bing is auto-harvested.
+site:*.$t -www.$t
+site:$t (inurl:admin | inurl:login | inurl:dashboard | inurl:portal)
+site:$t (ext:php | ext:asp | ext:aspx | ext:jsp | ext:do)
+site:$t (inurl:api | inurl:v1 | inurl:v2 | inurl:graphql | inurl:swagger)
+site:$t intitle:"index of"
+site:$t (ext:sql | ext:log | ext:bak | ext:env | ext:conf | ext:yml)
+site:$t inurl:wp-content | inurl:wp-admin
+site:pastebin.com $t
+site:github.com $t
+site:gitlab.com $t
+site:trello.com $t
+site:s3.amazonaws.com $t
+EOF
+}
 
-  # --- Wayback Machine (CDX API, no key) : every host ever archived under the domain ---
-  (
-    timeout 90 curl -s \
-      "http://web.archive.org/cdx/search/cdx?url=${TARGET}&matchType=domain&fl=original&collapse=urlkey&output=text" \
-      2>/dev/null | grep -oE 'https?://[^/]+' | sed -E 's#https?://##; s#:[0-9]+$##'
-  ) >> "$OUT/.raw" &
-  local p4=$!
-
-  # --- Shodan DNS (needs SHODAN_API_KEY env or ~/.config/shodan/api_key) ---
-  local skey="${SHODAN_API_KEY:-$(cat "$HOME/.config/shodan/api_key" 2>/dev/null)}"
-  if [ -n "$skey" ]; then
-    (
-      timeout 60 curl -s "https://api.shodan.io/dns/domain/${TARGET}?key=${skey}" 2>/dev/null \
-        | grep -oE '"subdomains":\[[^]]*\]' | grep -oE '"[^"]+"' | tr -d '"' \
-        | grep -v '^subdomains$' | sed "s/\$/.${TARGET}/"
-    ) >> "$OUT/.raw" &
-  else
-    warn "Shodan skipped (set SHODAN_API_KEY or run 'shodan init <key>' to enable)"
-    ( : ) &
-  fi
-  local p5=$!
-
-  # heartbeat while the passive sources run, so it never looks frozen
-  local s=0
-  while kill -0 $p1 2>/dev/null || kill -0 $p2 2>/dev/null || kill -0 $p3 2>/dev/null \
-     || kill -0 $p4 2>/dev/null || kill -0 $p5 2>/dev/null; do
-    printf "\r%s[*]%s enumerating (subfinder·crt.sh·wayback·shodan)  %ds · %s raw%s" \
-      "$C" "$N" "$s" "$(sort -u "$OUT/.raw" 2>/dev/null | wc -l)" "$(printf '\033[K')"
-    sleep 3; s=$((s+3))
-  done
-  printf "\r%s" "$(printf '\033[K')"
-  wait $p1 $p2 $p3 $p4 $p5 2>/dev/null
-
-  {
-    grep -oE '[a-zA-Z0-9._-]+\.'"$(printf '%s' "$TARGET" | sed 's/\./\\./g')" "$OUT/.raw"
-    printf '%s\n' "$TARGET"          # always include the apex itself
-  } | tr '[:upper:]' '[:lower:]' | sort -u > "$all"
-  rm -f "$OUT/.raw"
-  ok "found $(wc -l < "$all") unique domains -> $all"
-  [ ! -s "$all" ] && { warn "no domains found"; return 0; }
-
-  : > "$live"                       # guarantee the file exists even if nothing is live
-
-  # prune to hosts that actually resolve, so the HTTP probe isn't wasted on dead
-  # DNS (crt.sh returns plenty of junk). This is fast and parallel.
-  local resolved="$OUT/.resolved"; : > "$resolved"
-  info "resolving DNS (parallel)"
-  if have dnsx; then
-    timeout 60 dnsx -silent -l "$all" -o "$resolved" 2>/dev/null
-  else
-    timeout 60 xargs -a "$all" -P 50 -I{} sh -c \
-      'dig +short +time=2 +tries=1 "$1" 2>/dev/null | grep -qE "^[0-9]" && echo "$1"' _ {} \
-      > "$resolved" 2>/dev/null
-  fi
-  sort -u -o "$resolved" "$resolved" 2>/dev/null
-  [ -s "$resolved" ] || cp "$all" "$resolved"   # fall back to full list if prune yielded nothing
-  ok "$(wc -l < "$resolved") resolve to an IP"
-
-  info "probing for live hosts (budget ${DOMAIN_PROBE_BUDGET}s)"
-  if [ -n "$HTTPX" ]; then
-    # Notes learned the hard way:
-    #  - httpx -o can lose buffered results if `timeout` SIGKILLs it, so we stream
-    #    stdout through stdbuf (line-buffered) into the file -> partial hits survive.
-    #  - -timeout 5 -retries 0 abandons a hanging/tarpit host fast (no wasted budget).
-    #  - keep it to -status-code here (fast); titles/tech come in mode 2.
-    # feed via stdin, NOT -l: httpx's -l mode deadlocks on stdin when stdout is a pipe/file
-    local pt=$(( THREADS > 60 ? 60 : THREADS ))
-    run_timed "probing live hosts" "$DOMAIN_PROBE_BUDGET" "$OUT/live_verbose.txt" \
-      sh -c "cat '$resolved' | '$HTTPX' -silent -threads $pt -timeout 5 -retries 0 -status-code"
-    grep -oE 'https?://[^ ]+' "$OUT/live_verbose.txt" 2>/dev/null | sort -u > "$live"
-    rm -f "$resolved"
-  else
-    warn "ProjectDiscovery httpx not found; falling back to dig resolution check"
-    warn "install it: go install github.com/projectdiscovery/httpx/cmd/httpx@latest"
-    cp "$resolved" "$live"        # already resolved above; treat resolvable as "working"
-    rm -f "$resolved"
-  fi
-  ok "$(wc -l < "$live" 2>/dev/null || echo 0) working domains -> $live"
-
-  ask_screenshots "$live" "domains"
+# Bing honours site: dorking without hard captchas — scrape a few pages and pull
+# any hostname under the target. This is our automated search-engine 'dorking'.
+_bing_dork(){
+  local t="$1" esc="$2"
+  local ua="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+  local off
+  for off in 1 11 21 31 41; do
+    timeout 15 curl -s -A "$ua" "https://www.bing.com/search?q=site%3A%2A.$t&count=10&first=$off" 2>/dev/null
+    sleep 1
+  done | grep -oE "[a-zA-Z0-9._-]+\.$esc" 2>/dev/null
 }
 
 # =============================================================================
-# MODE 2 — FINGERPRINT -> EXTENSIVE DIRECTORY SEARCH  (<= ~10 min)
+# MODE 1 — DOMAIN SEARCH: many parallel sources + dorking + brute + permute
+# =============================================================================
+mode_domains(){
+  local all="$OUT/all_domains.txt" live="$OUT/working_domains.txt"
+  local SRC="$OUT/.src"; mkdir -p "$SRC"
+  local esc; esc="$(printf '%s' "$TARGET" | sed 's/\./\\./g')"
+  local hostre="[a-zA-Z0-9._-]+\.$esc"
+  _gen_resolvers; _gen_dorks
+  info "enumerating ${W}$TARGET${N} — 15+ sources in parallel (budget ${DOMAIN_ENUM_BUDGET}s)"
+
+  local B="$DOMAIN_ENUM_BUDGET"
+  # ---- passive tool sources (each self-times-out, all concurrent) ----
+  ( have subfinder   && timeout "$B" subfinder -silent -all -d "$TARGET" 2>/dev/null ) > "$SRC/subfinder" &
+  ( have assetfinder && timeout "$B" assetfinder --subs-only "$TARGET" 2>/dev/null ) > "$SRC/assetfinder" &
+  ( have findomain   && timeout "$B" findomain -q -t "$TARGET" 2>/dev/null ) > "$SRC/findomain" &
+  ( have amass       && timeout "$B" amass enum -passive -nocolor -silent -d "$TARGET" 2>/dev/null | awk '{print $1}' ) > "$SRC/amass" &
+  local ght="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+  ( [ -n "$ght" ] && have github-subdomains && timeout "$B" github-subdomains -d "$TARGET" -t "$ght" -q 2>/dev/null ) > "$SRC/github" &
+
+  # ---- key-free HTTP data sources ----
+  ( timeout 60 curl -s "https://crt.sh/?q=%25.$TARGET&output=json" 2>/dev/null \
+      | grep -oE '"common_name":"[^"]+"|"name_value":"[^"]+"' | sed -E 's/.*":"//; s/"$//; s/\\n/\n/g; s/^\*\.//' ) > "$SRC/crtsh" &
+  ( timeout 60 curl -s "https://api.certspotter.com/v1/issuances?domain=$TARGET&include_subdomains=true&expand=dns_names" 2>/dev/null \
+      | grep -oE "$hostre" ) > "$SRC/certspotter" &
+  ( timeout 45 curl -s "https://api.hackertarget.com/hostsearch/?q=$TARGET" 2>/dev/null | cut -d, -f1 ) > "$SRC/hackertarget" &
+  ( timeout 45 curl -s "https://otx.alienvault.com/api/v1/indicators/domain/$TARGET/passive_dns" 2>/dev/null \
+      | grep -oE '"hostname": *"[^"]+"' | sed -E 's/.*": *"//; s/"$//' ) > "$SRC/otx" &
+  ( timeout 45 curl -s "https://rapiddns.io/subdomain/$TARGET?full=1" 2>/dev/null | grep -oE "$hostre" ) > "$SRC/rapiddns" &
+  ( timeout 45 curl -s "https://urlscan.io/api/v1/search/?q=domain:$TARGET&size=10000" 2>/dev/null | grep -oE "$hostre" ) > "$SRC/urlscan" &
+  ( timeout 45 curl -s "https://api.subdomain.center/?domain=$TARGET" 2>/dev/null | grep -oE "$hostre" ) > "$SRC/subdomaincenter" &
+  ( timeout 90 curl -s "http://web.archive.org/cdx/search/cdx?url=$TARGET&matchType=domain&fl=original&collapse=urlkey&output=text" 2>/dev/null \
+      | grep -oE 'https?://[^/]+' | sed -E 's#https?://##; s#:[0-9]+$##' ) > "$SRC/wayback" &
+
+  # ---- search-engine dorking: Bing scrape + theHarvester (duckduckgo etc.) ----
+  ( _bing_dork "$TARGET" "$esc" ) > "$SRC/bing_dork" &
+  ( have theHarvester && { timeout 120 theHarvester -d "$TARGET" -b certspotter,crtsh,duckduckgo,otx,rapiddns,urlscan,hackertarget -f "$OUT/.th" >/dev/null 2>&1; \
+       grep -hoE "$hostre" "$OUT/.th.json" "$OUT/.th.xml" 2>/dev/null; } ) > "$SRC/theharvester" &
+
+  # ---- Shodan (optional key) ----
+  local skey="${SHODAN_API_KEY:-$(cat "$HOME/.config/shodan/api_key" 2>/dev/null)}"
+  ( [ -n "$skey" ] && timeout 60 curl -s "https://api.shodan.io/dns/domain/$TARGET?key=$skey" 2>/dev/null \
+      | grep -oE '"subdomains":\[[^]]*\]' | grep -oE '"[^"]+"' | tr -d '"' | grep -v '^subdomains$' | sed "s/\$/.$TARGET/" ) > "$SRC/shodan" &
+  [ -z "$skey" ] && warn "Shodan skipped (set SHODAN_API_KEY to enable)"
+
+  # heartbeat until all background sources finish (or their own timeouts fire)
+  local s=0
+  while [ -n "$(jobs -rp)" ]; do
+    printf "\r%s[*]%s enumerating  %ds · %s unique so far%s" "$C" "$N" "$s" \
+      "$(cat "$SRC"/* 2>/dev/null | grep -oE "$hostre" | sort -u | wc -l | tr -d ' ')" "$(printf '\033[K')"
+    sleep 3; s=$((s+3)); [ "$s" -gt $((B+140)) ] && break
+  done
+  wait 2>/dev/null
+  printf "\r%s" "$(printf '\033[K')"
+
+  { cat "$SRC"/* 2>/dev/null | grep -oE "$hostre"; printf '%s\n' "$TARGET"; } \
+    | tr '[:upper:]' '[:lower:]' | sed 's/^\*\.//; s/\.$//' | sort -u > "$all"
+  rm -rf "$SRC"; rm -f "$OUT/.th" "$OUT/.th.json" "$OUT/.th.xml"
+  ok "$(wc -l < "$all" | tr -d ' ') unique subdomains from passive + dork sources"
+
+  # ---- active DNS brute force (wildcard-filtered via puredns) ----
+  if [ "$SUB_BRUTE" = "1" ] && [ -n "$WL_SUB" ] && [ -f "$WL_SUB" ]; then
+    info "DNS brute force ($(wc -l < "$WL_SUB" | tr -d ' ') words, wildcard-filtered)"
+    : > "$OUT/.brute"
+    if have puredns; then
+      timeout "$SUB_BRUTE_BUDGET" puredns bruteforce "$WL_SUB" "$TARGET" -r "$OUT/.resolvers" -q 2>/dev/null | sort -u > "$OUT/.brute"
+    elif have dnsx; then
+      timeout "$SUB_BRUTE_BUDGET" dnsx -silent -d "$TARGET" -w "$WL_SUB" -r "$OUT/.resolvers" -t 200 2>/dev/null | sort -u > "$OUT/.brute"
+    fi
+    [ -s "$OUT/.brute" ] && { cat "$OUT/.brute" >> "$all"; ok "brute added $(wc -l < "$OUT/.brute" | tr -d ' ') names"; }
+    rm -f "$OUT/.brute"
+  fi
+
+  # ---- permutations (alterx) resolved live — guarded so it can't explode ----
+  if [ "$SUB_PERMUTE" = "1" ] && have alterx && [ "$(wc -l < "$all" | tr -d ' ')" -le 3000 ]; then
+    info "permuting known names (alterx) and resolving"
+    sort -u "$all" | timeout 60 alterx -silent 2>/dev/null | head -n 200000 > "$OUT/.perm"
+    if [ -s "$OUT/.perm" ]; then
+      : > "$OUT/.permres"
+      if have puredns; then
+        timeout "$SUB_BRUTE_BUDGET" puredns resolve "$OUT/.perm" -r "$OUT/.resolvers" -q 2>/dev/null | sort -u > "$OUT/.permres"
+      elif have dnsx; then
+        timeout "$SUB_BRUTE_BUDGET" dnsx -silent -l "$OUT/.perm" -r "$OUT/.resolvers" -t 200 2>/dev/null | sort -u > "$OUT/.permres"
+      fi
+      [ -s "$OUT/.permres" ] && { cat "$OUT/.permres" >> "$all"; ok "permutations added $(wc -l < "$OUT/.permres" | tr -d ' ') resolving names"; }
+    fi
+    rm -f "$OUT/.perm" "$OUT/.permres"
+  fi
+
+  sort -u -o "$all" "$all"
+  ok "found ${W}$(wc -l < "$all" | tr -d ' ')${N} total unique subdomains -> $all"
+  [ ! -s "$all" ] && { warn "no domains found"; return 0; }
+
+  # ---- resolve, then HTTP-probe for genuinely live hosts ----
+  : > "$live"
+  local resolved="$OUT/.resolved"; : > "$resolved"
+  info "resolving DNS"
+  if have dnsx; then
+    timeout 90 dnsx -silent -l "$all" -r "$OUT/.resolvers" -t 200 -o "$resolved" 2>/dev/null
+  else
+    timeout 90 xargs -a "$all" -P 60 -I{} sh -c \
+      'dig +short +time=2 +tries=1 "$1" 2>/dev/null | grep -qE "^[0-9]" && echo "$1"' _ {} > "$resolved" 2>/dev/null
+  fi
+  sort -u -o "$resolved" "$resolved" 2>/dev/null
+  [ -s "$resolved" ] || cp "$all" "$resolved"
+  ok "$(wc -l < "$resolved" | tr -d ' ') resolve to an IP"
+
+  info "probing for live hosts (budget ${DOMAIN_PROBE_BUDGET}s)"
+  if [ -n "$HTTPX" ]; then
+    local pt=$(( THREADS > 150 ? 150 : THREADS ))
+    run_timed "probing live hosts" "$DOMAIN_PROBE_BUDGET" "$OUT/live_verbose.txt" \
+      sh -c "cat '$resolved' | '$HTTPX' -silent -threads $pt -timeout 5 -retries 0 -status-code -title -rl 300 -no-color"
+    grep -oE 'https?://[^ ]+' "$OUT/live_verbose.txt" 2>/dev/null | sort -u > "$live"
+  else
+    warn "ProjectDiscovery httpx not found; treating resolvable hosts as live"
+    warn "install it: go install github.com/projectdiscovery/httpx/cmd/httpx@latest"
+    cp "$resolved" "$live"
+  fi
+  rm -f "$resolved"
+  ok "${W}$(wc -l < "$live" 2>/dev/null | tr -d ' ')${N} working domains -> $live"
+
+  # ---- screenshot every working domain (auto unless disabled) ----
+  if [ "$AUTO_SHOTS_MODE1" = "1" ] && [ -s "$live" ]; then
+    mode_screenshot "$live"
+  else
+    ask_screenshots "$live" "domains"
+  fi
+  rm -f "$OUT/.resolvers"
+}
+
+# brute ONE host. ffuf with -ac (auto-calibrate) learns the target's soft-404
+# baseline and drops anything that looks like it -> no junk/garbage paths. Falls
+# back to feroxbuster then gobuster. Emits clean, code-sorted "CODE  SIZE  URL".
+_dir_brute_one(){
+  local url="$1" per="$2" wl="$3"
+  local safe; safe=$(printf '%s' "$url" | sed 's#https\?://##; s#[/:]#_#g')
+  local out="$OUT/dirs/${safe}.txt"; : > "$out"
+  local tf="$OUT/dirs/.${safe}.json"
+  if have ffuf; then
+    ffuf -u "${url%/}/FUZZ" -w "$wl:FUZZ" -ac \
+         -mc 200,204,301,302,307,308,401,403,405 -fc 404 -ic \
+         -t "$THREADS" -timeout 7 -maxtime "$per" -rate 0 \
+         -of json -o "$tf" -s >/dev/null 2>&1
+    if [ -s "$tf" ]; then
+      if have jq; then
+        jq -r '.results[]? | "\(.status)\t\(.length)\t\(.url)"' "$tf" 2>/dev/null | sort -k1,1n -u > "$out"
+      else
+        grep -oE '"url":"[^"]+"' "$tf" | sed 's/"url":"//; s/"$//' | sort -u > "$out"
+      fi
+      rm -f "$tf"
+    fi
+  elif have feroxbuster; then
+    timeout "$per" feroxbuster -u "$url" -w "$wl" -t "$THREADS" -k -q -n \
+      -C 404,400,500,502,503 2>/dev/null | sort -u > "$out"
+  elif have gobuster; then
+    timeout "$per" gobuster dir -u "$url" -w "$wl" -t "$THREADS" -q -b 404,400 2>/dev/null | sort -u > "$out"
+  fi
+  ok "[dir] $safe -> $(wc -l < "$out" 2>/dev/null | tr -d ' ') paths"
+}
+
+# =============================================================================
+# MODE 2 — FINGERPRINT -> PARALLEL, CLEAN DIRECTORY SEARCH
 # =============================================================================
 mode_fingerprint_dirs(){
   local live="$OUT/working_domains.txt"
@@ -258,59 +367,53 @@ mode_fingerprint_dirs(){
       echo "https://$TARGET" > "$live"
     fi
   fi
-  info "$(wc -l < "$live") live hosts to fingerprint"
+  info "$(wc -l < "$live" | tr -d ' ') live hosts to fingerprint"
 
-  info "fingerprinting (httpx tech-detect + whatweb)"
+  info "fingerprinting (httpx tech-detect$(have whatweb && printf ' + whatweb'))"
   if [ -n "$HTTPX" ]; then
-    # stdin-fed (see mode 1 note); -title/-tech-detect read bodies so allow a longer timeout
-    run_timed "fingerprinting" 120 "$tech" \
-      sh -c "grep -oE 'https?://[^ ]+' '$live' | '$HTTPX' -silent -threads $THREADS -timeout 8 -retries 0 -status-code -title -tech-detect -web-server"
+    run_timed "fingerprinting" 90 "$tech" \
+      sh -c "grep -oE 'https?://[^ ]+' '$live' | '$HTTPX' -silent -threads $THREADS -timeout 8 -retries 0 -status-code -title -td -web-server -rl 300 -no-color"
   fi
-  if have whatweb; then
-    timeout 120 whatweb -q --no-errors -i "$live" --log-brief="$OUT/whatweb.txt" >/dev/null 2>&1
-  fi
-  # tech may come from httpx OR whatweb; ensure we have something to select from
+  have whatweb && timeout 90 whatweb -q --no-errors -i "$live" --log-brief="$OUT/whatweb.txt" >/dev/null 2>&1
   [ ! -s "$tech" ] && [ -s "$OUT/whatweb.txt" ] && cp "$OUT/whatweb.txt" "$tech"
-  [ -s "$tech" ] && { ok "fingerprint -> $tech"; sed 's/^/    /' "$tech" | head -30; }
+  [ -s "$tech" ] && { ok "fingerprint -> $tech"; sed 's/^/    /' "$tech" | head -25; }
 
-  local pat='WordPress|Jenkins|GitLab|Tomcat|phpMyAdmin|Django|Laravel|Spring|Drupal|Joomla|Grafana|Kibana|Jira|Confluence|Struts|WebLogic|401|403|500'
-  if [ -s "$tech" ]; then
-    grep -iE "$pat" "$tech" | grep -oE 'https?://[^ ]+' | sort -u > "$valuable"
+  # rank hosts: interesting tech / auth-gated / error pages first, then the rest
+  local pat='WordPress|Jenkins|GitLab|Tomcat|phpMyAdmin|Django|Laravel|Spring|Drupal|Joomla|Grafana|Kibana|Jira|Confluence|Struts|WebLogic|Swagger|GraphQL|Kubernetes|\[40[13]\]|\[500\]'
+  : > "$valuable"
+  [ -s "$tech" ] && grep -iE "$pat" "$tech" | grep -oE 'https?://[^ ]+' | sort -u > "$valuable"
+  { cat "$valuable"; grep -oE 'https?://[^ ]+' "$live"; } | awk '!seen[$0]++' > "$valuable.t" && mv "$valuable.t" "$valuable"
+  local HOST_CAP=12
+  if [ "$(wc -l < "$valuable" | tr -d ' ')" -gt "$HOST_CAP" ]; then
+    head -n "$HOST_CAP" "$valuable" > "$valuable.t"; mv "$valuable.t" "$valuable"
+    warn "capping directory brute to $HOST_CAP hosts (valuable ones first)"
   fi
-  [ ! -s "$valuable" ] && grep -oE 'https?://[^ ]+' "$live" | sort -u > "$valuable"
-  local n; n=$(wc -l < "$valuable"); [ "$n" -lt 1 ] && n=1
-  ok "$n valuable target(s) selected -> $valuable"
+  local n; n=$(wc -l < "$valuable" | tr -d ' '); [ "$n" -lt 1 ] && n=1
+  ok "$n target(s) for directory brute -> $valuable"
 
-  local wl="$WL_DIR_SMALL"
-  [ -f "$WL_DIR_BIG" ] && wl="$WL_DIR_BIG"
-  [ -f "$wl" ] || { err "no wordlist found (install seclists)"; return 1; }
-  info "wordlist: $wl"
+  local wl="$WL_DIR_SMALL"; [ -f "$WL_DIR_BIG" ] && wl="$WL_DIR_BIG"
+  [ -f "$wl" ] || { err "no wordlist found (install seclists or bundle ./wordlists)"; return 1; }
+  info "wordlist: $wl ($(wc -l < "$wl" | tr -d ' ') entries)"
 
-  local per=$(( DIR_BUDGET / n )); [ "$per" -lt 45 ] && per=45
-  local cap=8
-  info "directory brute: ${per}s/host, up to $cap hosts (total cap ${DIR_BUDGET}s)"
-
+  # ---- run several hosts at once; each ffuf is itself multi-threaded ----
   mkdir -p "$OUT/dirs"
+  local PAR=4
+  local chunks=$(( (n + PAR - 1) / PAR ))
+  local per=$(( DIR_BUDGET / chunks )); [ "$per" -lt 60 ] && per=60; [ "$per" -gt 150 ] && per=150
+  info "directory brute: $PAR hosts in parallel, ${per}s/host (~${DIR_BUDGET}s total)"
+
   local i=0
-  while read -r url; do
+  while IFS= read -r url; do
     [ -z "$url" ] && continue
-    i=$((i+1)); [ "$i" -gt "$cap" ] && { warn "host cap reached"; break; }
-    local safe; safe=$(echo "$url" | sed 's#https\?://##; s#[/:]#_#g')
-    local hit="$OUT/dirs/${safe}.txt"
-    # each tool prints found paths to stdout -> run_timed streams them with a live counter
-    if have feroxbuster; then
-      run_timed "[$i/$n] brute $url" "$per" "$hit" feroxbuster -u "$url" -w "$wl" -t "$THREADS" -q -k
-    elif have ffuf; then
-      run_timed "[$i/$n] brute $url" "$per" "$hit" ffuf -u "${url%/}/FUZZ" -w "$wl" -t "$THREADS" \
-        -mc 200,204,301,302,307,401,403,405 -s
-    elif have gobuster; then
-      run_timed "[$i/$n] brute $url" "$per" "$hit" gobuster dir -u "$url" -w "$wl" -t "$THREADS" -q
-    else
-      err "no directory bruteforcer available (ffuf/feroxbuster/gobuster)"; break
-    fi
-    ok "[$i/$n] $url -> $(wc -l < "$hit" 2>/dev/null || echo 0) paths in ${safe}.txt"
+    i=$((i+1))
+    _dir_brute_one "$url" "$per" "$wl" &
+    [ $(( i % PAR )) -eq 0 ] && wait
   done < "$valuable"
-  ok "directory search complete -> $OUT/dirs/"
+  wait
+
+  local combined="$OUT/all_dirs.txt"
+  cat "$OUT"/dirs/*.txt 2>/dev/null | sort -u > "$combined"
+  ok "directory search complete -> $OUT/dirs/ (combined $(wc -l < "$combined" 2>/dev/null | tr -d ' ') paths in all_dirs.txt)"
 
   ask_screenshots "$valuable" "valuable hosts"
 }
