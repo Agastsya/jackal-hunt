@@ -37,9 +37,12 @@ Mode 1 runs 15+ sources **concurrently** and merges them unique:
   github-subdomains (with `GITHUB_TOKEN`)
 - **Key-free APIs:** crt.sh, certspotter, hackertarget, AlienVault OTX,
   rapiddns, urlscan.io, subdomain.center, Wayback CDX
-- **Search-engine dorking:** automated Bing `site:` scraping + theHarvester
-  (DuckDuckGo/CT/OTX/…). A `search_dorks.txt` of ready Google/DDG dorks is also
-  written for manual follow-up (Google blocks automation).
+- **Search-engine dorking:** `site:` dorks run across Google, Bing and
+  DuckDuckGo. Raw HTML scraping is bot-blocked and best-effort, so for
+  **reliable Google dorking set `GOOGLE_API_KEY` + `GOOGLE_CSE_ID`** (Custom
+  Search JSON API, free 100 queries/day) — it's then used first and extensively.
+  theHarvester adds more engines, and a `search_dorks.txt` of ready dorks is
+  written for manual follow-up.
 - **Shodan** DNS (with `SHODAN_API_KEY`)
 - **Active (optional, on by default):** wildcard-filtered DNS brute force via
   `puredns`, and `alterx` permutations resolved live — both guarded so they
@@ -58,6 +61,12 @@ results instead of thousands of false hits. Output is clean, code-sorted
 so interesting tech / auth-gated / error hosts go first. Falls back to
 feroxbuster then gobuster.
 
+On top of brute force, mode 2 runs **Google-dork content discovery** on the top
+hosts (`site:host inurl:admin`, `ext:php`, `intitle:index.of`, …). Anything a
+search engine has indexed genuinely exists, so these are zero-junk real paths
+that brute force alone would miss — merged into `all_dirs.txt` and
+`dorked_dirs.txt`.
+
 ## Requirements
 
 Core: `bash`, `curl`. Recommended tools (install what you can):
@@ -73,10 +82,16 @@ The script is cross-platform but needs GNU coreutils on macOS for its time
 budgets and progress meters:
 
 ```bash
-brew install coreutils           # provides timeout/stdbuf/nproc
+brew install coreutils              # provides timeout/stdbuf/nproc
+brew install --cask chromium        # headless browser for screenshots
 # ProjectDiscovery httpx (a compiled binary, not the pip 'httpx'):
 go install github.com/projectdiscovery/httpx/cmd/httpx@latest
 ```
+
+Chromium is an unsigned cask; if a first headless launch is blocked by
+Gatekeeper, clear the quarantine once: `xattr -dr com.apple.quarantine
+/Applications/Chromium.app`. The script auto-detects browsers installed as macOS
+`.app` bundles (Chromium/Chrome/Brave/Edge), not just ones on `PATH`.
 
 The script auto-detects the coreutils `gnubin` dir, prefers the compiled
 (Mach-O/ELF) httpx over the Python one, and auto-discovers SecLists wordlists
@@ -92,6 +107,7 @@ across `/usr/share`, brew's `share`, and `./wordlists/`.
 | `JACKAL_PERMUTE=0` | `1` | skip alterx permutations |
 | `JACKAL_HEADLESS=1` | – | render JS when crawling (mode 3) |
 | `GITHUB_TOKEN` / `SHODAN_API_KEY` | – | enable those sources |
+| `GOOGLE_API_KEY` + `GOOGLE_CSE_ID` | – | reliable Google dorking via Custom Search API |
 
 Time budgets (seconds) live at the top of the script: `DOMAIN_ENUM_BUDGET`,
 `SUB_BRUTE_BUDGET`, `DOMAIN_PROBE_BUDGET`, `DIR_BUDGET`, `CRAWL_BUDGET`,
