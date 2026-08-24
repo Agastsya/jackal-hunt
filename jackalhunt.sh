@@ -159,19 +159,25 @@ _gen_resolvers(){
 EOF
 }
 
-# ready-to-run search dorks for manual deep digging (Google blocks automation,
-# so these are for you to paste; Bing is auto-harvested by _bing_dork below)
+# ready-to-run dorks for manual deep digging (kept as a deliverable even though we
+# also auto-run them across Google/Bing/DuckDuckGo below)
 _gen_dorks(){
   local t="$TARGET"
   cat > "$OUT/search_dorks.txt" <<EOF
-# Manual dorks for $t — paste into Google/DuckDuckGo. Bing is auto-harvested.
+# Dorks for $t — also auto-run across Google/Bing/DuckDuckGo by jackalhunt.
+# SUBDOMAINS
 site:*.$t -www.$t
+site:$t
+# CONTENT / DIRECTORIES / FILES
 site:$t (inurl:admin | inurl:login | inurl:dashboard | inurl:portal)
-site:$t (ext:php | ext:asp | ext:aspx | ext:jsp | ext:do)
-site:$t (inurl:api | inurl:v1 | inurl:v2 | inurl:graphql | inurl:swagger)
+site:$t (ext:php | ext:asp | ext:aspx | ext:jsp | ext:do | ext:action)
+site:$t (inurl:api | inurl:v1 | inurl:v2 | inurl:graphql | inurl:swagger | inurl:rest)
 site:$t intitle:"index of"
-site:$t (ext:sql | ext:log | ext:bak | ext:env | ext:conf | ext:yml)
-site:$t inurl:wp-content | inurl:wp-admin
+site:$t (ext:sql | ext:log | ext:bak | ext:old | ext:env | ext:conf | ext:yml | ext:json | ext:xml)
+site:$t (inurl:wp-content | inurl:wp-admin | inurl:phpmyadmin)
+site:$t (inurl:config | inurl:setup | inurl:backup | inurl:test | inurl:dev | inurl:staging)
+site:$t (inurl:? & (inurl:id | inurl:file | inurl:page | inurl:redirect | inurl:url))
+# EXPOSURE / LEAKS
 site:pastebin.com $t
 site:github.com $t
 site:gitlab.com $t
@@ -180,16 +186,60 @@ site:s3.amazonaws.com $t
 EOF
 }
 
-# Bing honours site: dorking without hard captchas — scrape a few pages and pull
-# any hostname under the target. This is our automated search-engine 'dorking'.
-_bing_dork(){
-  local t="$1" esc="$2"
-  local ua="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-  local off
-  for off in 1 11 21 31 41; do
-    timeout 15 curl -s -A "$ua" "https://www.bing.com/search?q=site%3A%2A.$t&count=10&first=$off" 2>/dev/null
-    sleep 1
-  done | grep -oE "[a-zA-Z0-9._-]+\.$esc" 2>/dev/null
+# --- automated search-engine dorking ------------------------------------------
+# Reality check: scraping Google/Bing/DuckDuckGo HTML is bot-blocked and usually
+# returns little. The RELIABLE programmatic Google-dork path is the Custom Search
+# JSON API — set GOOGLE_API_KEY + GOOGLE_CSE_ID (free 100 queries/day) and it is
+# used first, extensively. HTML scraping stays on as best-effort backup.
+_UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+GCSE_KEY="${GOOGLE_API_KEY:-}"; GCSE_CX="${GOOGLE_CSE_ID:-}"
+_urldecode(){ python3 -c 'import sys,urllib.parse as u; sys.stdout.write(u.unquote(sys.stdin.read()))' 2>/dev/null; }
+_urlencode(){ python3 -c 'import sys,urllib.parse as u; sys.stdout.write(u.quote(sys.stdin.read()))' 2>/dev/null \
+              || printf '%s' "$1" | sed 's/ /+/g; s/:/%3A/g; s/"/%22/g'; }
+_dork_engines(){ [ -n "$GCSE_KEY" ] && [ -n "$GCSE_CX" ] && printf 'gcse '; printf 'google bing ddg'; }
+
+# fetch one page of results for a query from one engine (page is 0-based).
+# gcse returns JSON (result links); the rest return raw HTML — callers just grep.
+_dork_fetch(){
+  local engine="$1" q="$2" page="${3:-0}" enc
+  enc="$(printf '%s' "$q" | _urlencode)"
+  case "$engine" in
+    gcse)   [ -n "$GCSE_KEY" ] && [ -n "$GCSE_CX" ] && \
+              timeout 15 curl -s "https://www.googleapis.com/customsearch/v1?key=$GCSE_KEY&cx=$GCSE_CX&q=$enc&num=10&start=$((page*10+1))" 2>/dev/null ;;
+    google) timeout 15 curl -s -A "$_UA" -H 'Accept-Language: en-US,en;q=0.9' \
+              --cookie 'CONSENT=YES+' "https://www.google.com/search?q=$enc&num=100&start=$((page*10))" 2>/dev/null ;;
+    bing)   timeout 15 curl -s -A "$_UA" "https://www.bing.com/search?q=$enc&count=30&first=$((page*10+1))" 2>/dev/null ;;
+    ddg)    timeout 15 curl -s -A "$_UA" --data-urlencode "q=$q" "https://html.duckduckgo.com/html/" 2>/dev/null ;;
+  esac
+}
+
+# harvest subdomains via site: dorks across every available engine
+_dork_subs(){
+  local t="$1" esc="$2" eng q p engines; engines="$(_dork_engines)"
+  {
+    for q in "site:*.$t -www.$t" "site:$t"; do
+      for eng in $engines; do
+        for p in 0 1 2; do _dork_fetch "$eng" "$q" "$p"; sleep 1; done
+      done
+    done
+  } | _urldecode | grep -oE "[a-zA-Z0-9._-]+\.$esc" 2>/dev/null
+}
+
+# harvest INDEXED real paths/files for one host via content dorks. Anything a
+# search engine has indexed genuinely exists -> zero-junk directory intel.
+_dork_dirs(){
+  local host="$1" esc eng q engines; engines="$(_dork_engines)"
+  esc="$(printf '%s' "$host" | sed 's/\./\\./g')"
+  {
+    for q in \
+      "site:$host inurl:admin" "site:$host inurl:login" "site:$host inurl:api" \
+      "site:$host ext:php" "site:$host ext:aspx" "site:$host ext:jsp" \
+      "site:$host ext:json OR ext:xml OR ext:conf OR ext:bak OR ext:old OR ext:env" \
+      "site:$host intitle:index.of" "site:$host"; do
+      for eng in $engines; do _dork_fetch "$eng" "$q" 0; sleep 1; done
+    done
+  } | _urldecode | grep -oE "https?://$esc(:[0-9]+)?/[^ \"'<>)]+" 2>/dev/null \
+    | sed 's/&amp;.*//; s/[),.]*$//' | sort -u
 }
 
 # =============================================================================
@@ -226,8 +276,13 @@ mode_domains(){
   ( timeout 90 curl -s "http://web.archive.org/cdx/search/cdx?url=$TARGET&matchType=domain&fl=original&collapse=urlkey&output=text" 2>/dev/null \
       | grep -oE 'https?://[^/]+' | sed -E 's#https?://##; s#:[0-9]+$##' ) > "$SRC/wayback" &
 
-  # ---- search-engine dorking: Bing scrape + theHarvester (duckduckgo etc.) ----
-  ( _bing_dork "$TARGET" "$esc" ) > "$SRC/bing_dork" &
+  # ---- search-engine dorking: Google(CSE) + Bing + DuckDuckGo + theHarvester ----
+  if [ -n "$GCSE_KEY" ] && [ -n "$GCSE_CX" ]; then
+    info "Google dorking via Custom Search API (reliable)"
+  else
+    warn "Google dorking limited: set GOOGLE_API_KEY + GOOGLE_CSE_ID for reliable results (scraping is best-effort)"
+  fi
+  ( _dork_subs "$TARGET" "$esc" ) > "$SRC/search_dorks" &
   ( have theHarvester && { timeout 120 theHarvester -d "$TARGET" -b certspotter,crtsh,duckduckgo,otx,rapiddns,urlscan,hackertarget -f "$OUT/.th" >/dev/null 2>&1; \
        grep -hoE "$hostre" "$OUT/.th.json" "$OUT/.th.xml" 2>/dev/null; } ) > "$SRC/theharvester" &
 
@@ -247,8 +302,11 @@ mode_domains(){
   wait 2>/dev/null
   printf "\r%s" "$(printf '\033[K')"
 
-  { cat "$SRC"/* 2>/dev/null | grep -oE "$hostre"; printf '%s\n' "$TARGET"; } \
-    | tr '[:upper:]' '[:lower:]' | sed 's/^\*\.//; s/\.$//' | sort -u > "$all"
+  # Extract maximal host tokens, then keep only those whose suffix is EXACTLY the
+  # target — so "example.company" can't masquerade as a subdomain of example.com.
+  { cat "$SRC"/* 2>/dev/null | tr '[:upper:]' '[:lower:]' \
+      | grep -oE '[a-z0-9._-]+' | grep -E "(^|\.)$esc\$"; printf '%s\n' "$TARGET"; } \
+    | sed 's/^\*\.//; s/^\.*//; s/\.$//' | grep -E "\.$esc\$|^$esc\$" | sort -u > "$all"
   rm -rf "$SRC"; rm -f "$OUT/.th" "$OUT/.th.json" "$OUT/.th.xml"
   ok "$(wc -l < "$all" | tr -d ' ') unique subdomains from passive + dork sources"
 
@@ -411,8 +469,25 @@ mode_fingerprint_dirs(){
   done < "$valuable"
   wait
 
+  # ---- Google-dork content discovery: indexed = real, so zero-junk paths that
+  #      brute force alone would miss. Runs on the top hosts, in parallel. ----
+  local dorked="$OUT/dorked_dirs.txt"; : > "$dorked"
+  local DORK_HOSTS=5 j=0
+  info "google-dorking indexed paths on up to $DORK_HOSTS hosts (Google/Bing/DDG)"
+  while IFS= read -r url; do
+    [ -z "$url" ] && continue
+    j=$((j+1)); [ "$j" -gt "$DORK_HOSTS" ] && break
+    local host; host=$(printf '%s' "$url" | sed 's#https\?://##; s#[/:].*##')
+    ( _dork_dirs "$host" >> "$dorked" ) &
+    [ $(( j % PAR )) -eq 0 ] && wait
+  done < "$valuable"
+  wait
+  sort -u -o "$dorked" "$dorked" 2>/dev/null
+  ok "dorking found $(wc -l < "$dorked" 2>/dev/null | tr -d ' ') indexed URLs -> $dorked"
+
+  # ---- merge brute + dork results into one clean, deduped report ----
   local combined="$OUT/all_dirs.txt"
-  cat "$OUT"/dirs/*.txt 2>/dev/null | sort -u > "$combined"
+  { cat "$OUT"/dirs/*.txt 2>/dev/null; sed 's/^/DORK\t\t/' "$dorked" 2>/dev/null; } | sort -u > "$combined"
   ok "directory search complete -> $OUT/dirs/ (combined $(wc -l < "$combined" 2>/dev/null | tr -d ' ') paths in all_dirs.txt)"
 
   ask_screenshots "$valuable" "valuable hosts"
@@ -528,10 +603,24 @@ mode_screenshot(){
     warn "nothing to screenshot yet (run mode 1 or 3 first for $TARGET)"; return 0
   fi
   local chrome=""
-  for c in chromium chromium-browser google-chrome chrome; do
+  for c in chromium chromium-browser google-chrome google-chrome-stable chrome brave-browser; do
     have "$c" && { chrome="$(command -v "$c")"; break; }
   done
-  [ -z "$chrome" ] && { err "no chromium/chrome found — needed for screenshots"; return 1; }
+  # macOS installs browsers as .app bundles that aren't on PATH — check those too
+  if [ -z "$chrome" ]; then
+    local p
+    for p in \
+      "/Applications/Chromium.app/Contents/MacOS/Chromium" \
+      "$HOME/Applications/Chromium.app/Contents/MacOS/Chromium" \
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+      "$HOME/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+      "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser" \
+      "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"; do
+      [ -x "$p" ] && { chrome="$p"; break; }
+    done
+  fi
+  [ -z "$chrome" ] && { err "no chromium/chrome found — install: brew install --cask chromium"; return 1; }
+  info "browser: $chrome"
 
   mkdir -p "$ss"
   local list="$OUT/.shotlist"
