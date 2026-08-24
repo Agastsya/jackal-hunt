@@ -21,21 +21,50 @@ set -uo pipefail
 BASE_DIR="${JACKAL_HOME:-$HOME/recon}"
 RESULTS_DIR="$BASE_DIR/results"
 PATH="$HOME/go/bin:$PATH"     # PREPEND go tools so PD httpx beats /bin/httpx (python)
+# macOS ships without GNU timeout/stdbuf/nproc; `brew install coreutils` provides
+# them under a gnubin dir by their normal names. Prepend it so they resolve
+# directly AND compose (e.g. `timeout ... stdbuf ...`) — a shell-function shim
+# can't do that, since timeout execs its args and never sees a bash function.
+for _gnubin in /opt/homebrew/opt/coreutils/libexec/gnubin /usr/local/opt/coreutils/libexec/gnubin; do
+  [ -d "$_gnubin" ] && PATH="$_gnubin:$PATH"
+done
 export PATH
 
 # time budgets (seconds)
 DOMAIN_ENUM_BUDGET=240        # mode 1: enumeration
-DOMAIN_PROBE_BUDGET=60        # mode 1: live probing   (240+60 = 5 min)
+DOMAIN_PROBE_BUDGET=90        # mode 1: live probing
 DIR_BUDGET=600                # mode 2: directory brute total (10 min)
 CRAWL_BUDGET=200              # mode 3: TOTAL budget (katana + gau share this, seconds)
 SHOT_BUDGET=600               # mode 4: screenshotting crawled URLs (10 min)
 SHOT_CAP=150                  # max URLs to screenshot in one run
 
-# wordlists (auto-fallback if absent)
-WL_DIR_BIG="/usr/share/seclists/Discovery/Web-Content/raft-large-directories.txt"
-WL_DIR_SMALL="/usr/share/seclists/Discovery/Web-Content/common.txt"
+# behaviour toggles (env-overridable)
+SUB_BRUTE="${JACKAL_SUB_BRUTE:-1}"    # DNS-bruteforce subdomains with a wordlist
+SUB_PERMUTE="${JACKAL_PERMUTE:-1}"    # permute discovered names (alterx) and resolve
+AUTO_SHOTS_MODE1="${JACKAL_AUTOSHOT:-1}"  # auto-screenshot working domains after mode 1
 
-THREADS="$(( $(nproc 2>/dev/null || echo 4) * 8 ))"
+# wordlists — probe common SecLists locations (Linux, brew/macOS, kali, repo-local)
+# and fall back gracefully. Filled in by _resolve_wordlists() at startup.
+WL_DIR_BIG=""; WL_DIR_SMALL=""; WL_SUB=""
+_SL_DIRS="/usr/share/seclists /opt/homebrew/share/seclists /usr/local/share/seclists $HOME/seclists $HOME/.seclists"
+_resolve_wordlists(){
+  local d
+  for d in $_SL_DIRS; do
+    [ -z "$WL_DIR_BIG" ]   && [ -f "$d/Discovery/Web-Content/raft-large-directories.txt" ] && WL_DIR_BIG="$d/Discovery/Web-Content/raft-large-directories.txt"
+    [ -z "$WL_DIR_SMALL" ] && [ -f "$d/Discovery/Web-Content/common.txt" ] && WL_DIR_SMALL="$d/Discovery/Web-Content/common.txt"
+    [ -z "$WL_SUB" ] && [ -f "$d/Discovery/DNS/subdomains-top1million-110000.txt" ] && WL_SUB="$d/Discovery/DNS/subdomains-top1million-110000.txt"
+    [ -z "$WL_SUB" ] && [ -f "$d/Discovery/DNS/subdomains-top1million-5000.txt" ] && WL_SUB="$d/Discovery/DNS/subdomains-top1million-5000.txt"
+  done
+  # repo-local fallbacks bundled alongside this script (./wordlists/*)
+  local self; self="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+  [ -z "$WL_DIR_BIG" ]   && [ -f "$self/wordlists/content-common.txt" ] && WL_DIR_BIG="$self/wordlists/content-common.txt"
+  [ -z "$WL_DIR_SMALL" ] && [ -f "$self/wordlists/content-common.txt" ] && WL_DIR_SMALL="$self/wordlists/content-common.txt"
+  [ -z "$WL_SUB" ]       && [ -f "$self/wordlists/subdomains-common.txt" ] && WL_SUB="$self/wordlists/subdomains-common.txt"
+  : "${WL_DIR_BIG:=/usr/share/seclists/Discovery/Web-Content/raft-large-directories.txt}"
+  : "${WL_DIR_SMALL:=/usr/share/seclists/Discovery/Web-Content/common.txt}"
+}
+
+THREADS="$(( $(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) * 8 ))"
 
 # ----------------------------------------------------------------------------- colors
 if [ -t 1 ]; then
@@ -85,7 +114,9 @@ resolve_httpx(){
   local c
   for c in "$HOME/go/bin/httpx" $(command -v -a httpx 2>/dev/null); do
     [ -x "$c" ] || continue
-    if file -b "$c" 2>/dev/null | grep -qi 'ELF'; then HTTPX="$c"; return 0; fi
+    # PD httpx is a compiled binary: ELF on Linux, Mach-O on macOS. Python httpx
+    # is a text script, so matching either binary format rules the python one out.
+    if file -b "$c" 2>/dev/null | grep -qiE 'ELF|Mach-O'; then HTTPX="$c"; return 0; fi
   done
   HTTPX=""      # only python httpx (or none) available -> callers fall back
   return 1
@@ -509,6 +540,7 @@ dispatch(){
 main(){
   mkdir -p "$RESULTS_DIR"
   resolve_httpx || true
+  _resolve_wordlists
   local target="" listfile="" mode=""
   while getopts ":t:l:m:ysh" opt; do
     case "$opt" in
